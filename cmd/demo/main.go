@@ -49,7 +49,7 @@ func main() {
 	src := filepath.Join(work, "src")
 
 	section(0, "准备：在一个进程内启动本地 API 服务与数据目录")
-	srv := startServer(repoDir)
+	srv, eng := startServer(repoDir)
 	fmt.Printf("  API   : %s\n", srv.URL)
 	fmt.Printf("  仓库  : %s (manifest.sqlite + chunks/)\n", repoDir)
 	fmt.Printf("  数据源: %s\n", src)
@@ -268,11 +268,159 @@ func main() {
 	check("finish=false 留下 pending 快照", pend["status"] == "pending")
 	srv.Close()
 
-	srv = startServer(repoDir) // same repo, new process equivalent
+	srv, eng = startServer(repoDir) // same repo, new process equivalent
 	time.Sleep(100 * time.Millisecond)
 	si = get(srv.URL + fmt.Sprintf("/v1/snapshots/%d", pendID))
 	fmt.Printf("  重启后: 快照 %d status=%s\n", pendID, si["status"])
 	check("重启恢复把 pending 快照验证后提交为 committed", si["status"] == "committed")
+
+	// ---- 8. selective restore jobs ------------------------------------------
+	section(8, "选择性恢复：冻结路径集合、暂存区校验后原子发布、幂等、失败定位与断点恢复")
+
+	// 8.1 one deep file -> only it and its parent directories are restored
+	partial1 := filepath.Join(work, "partial-1")
+	code, body = raw("POST", srv.URL+"/v1/restore-jobs", map[string]any{
+		"snapshot_id": firstID, "target": partial1,
+		"paths": []string{"docs/notes.txt"}, "idempotency_key": "demo-p1",
+	})
+	check("创建选择性恢复作业 -> 201", code == http.StatusCreated)
+	job := body["job"].(map[string]any)
+	check("作业状态 done", job["status"] == "done")
+	jfiles, _ := body["files"].([]any)
+	fmt.Printf("  作业 %v: 计划 %d 行（选中文件 + 自动补足的父目录）\n", job["id"], len(jfiles))
+	for _, x := range jfiles {
+		m := x.(map[string]any)
+		fmt.Printf("    %-18s kind=%-8s implicit=%-5v status=%s\n", m["rel_path"], m["kind"], m["implicit"], m["status"])
+	}
+	check("计划只含 docs/（隐式父目录）与 docs/notes.txt", len(jfiles) == 2)
+	g1, _ := hashFile(filepath.Join(partial1, "docs", "notes.txt"))
+	w1, _ := hashFile(filepath.Join(restoreDir, "docs", "notes.txt"))
+	check("摘要与整树恢复结果一致", g1 == w1)
+	fi1, _ := os.Lstat(filepath.Join(partial1, "docs", "notes.txt"))
+	srcNotes, _ := os.Lstat(filepath.Join(src, "docs", "notes.txt"))
+	check("权限与 mtime 保留", fi1.Mode().Perm() == srcNotes.Mode().Perm() &&
+		fi1.ModTime().Equal(srcNotes.ModTime()))
+	_, err = os.Lstat(filepath.Join(partial1, "app.log"))
+	check("未选中的 app.log 不存在", os.IsNotExist(err))
+	_, err = os.Lstat(filepath.Join(partial1, "run.sh"))
+	check("未选中的 run.sh 不存在", os.IsNotExist(err))
+
+	// 8.2 missing link target -> precheck failure, nothing created
+	partial2 := filepath.Join(work, "partial-2")
+	code, body = raw("POST", srv.URL+"/v1/restore-jobs", map[string]any{
+		"snapshot_id": firstID, "target": partial2,
+		"paths": []string{"link_to_notes"}, "idempotency_key": "demo-p2",
+	})
+	fmt.Printf("  只选链接不选目标 -> HTTP %d: %s\n", code, body["message"])
+	check("预检拒绝并返回 422 missing_link_deps", code == http.StatusUnprocessableEntity &&
+		body["error"] == "missing_link_deps")
+	missDeps, _ := body["details"].(map[string]any)["missing"].([]any)
+	check("错误点名应一并纳入的依赖 docs/notes.txt", len(missDeps) == 1 && missDeps[0] == "docs/notes.txt")
+	_, err = os.Lstat(partial2)
+	check("预检失败：目标目录不存在", os.IsNotExist(err))
+	code, body = raw("POST", srv.URL+"/v1/restore-jobs", map[string]any{
+		"snapshot_id": firstID, "target": partial2,
+		"paths": []string{"link_to_notes", "docs/notes.txt"}, "idempotency_key": "demo-p2",
+	})
+	check("把依赖纳入选择后 -> 201 done", code == http.StatusCreated &&
+		body["job"].(map[string]any)["status"] == "done")
+	lt, _ = os.Readlink(filepath.Join(partial2, "link_to_notes"))
+	check("链接目标逐字保留 docs/notes.txt（绝不重写）", lt == "docs/notes.txt")
+
+	// 8.3 idempotency: same key -> same job; existing target -> 409
+	code, body = raw("POST", srv.URL+"/v1/restore-jobs", map[string]any{
+		"snapshot_id": firstID, "target": partial1,
+		"paths": []string{"docs/notes.txt"}, "idempotency_key": "demo-p1",
+	})
+	check("同一幂等键重放 -> 200 且返回同一作业", code == http.StatusOK &&
+		body["idempotent_replay"] == true && body["job"].(map[string]any)["id"] == job["id"])
+	code, body = raw("POST", srv.URL+"/v1/restore-jobs", map[string]any{
+		"snapshot_id": firstID, "target": partial1,
+		"paths": []string{"docs/notes.txt"}, "idempotency_key": "demo-other-key",
+	})
+	check("已有目标仍返回 409 target_exists", code == http.StatusConflict && body["error"] == "target_exists")
+	stagingLeft, _ := filepath.Glob(filepath.Join(work, ".incbackup-restore-staging-*"))
+	check("不产生第二棵树、不留暂存半成品", len(stagingLeft) == 0)
+
+	// 8.4 lost chunk -> job locates the failure; repair -> retry -> done
+	must(os.WriteFile(filepath.Join(src, "unique.bin"), []byte(strings.Repeat("UNIQUE-", 20000)), 0o644))
+	r = post(srv.URL+"/v1/snapshots", map[string]any{"root": src, "message": "for selective failure drill"})
+	selID := int64(r["snapshot_id"].(float64))
+	var victimDigest []byte
+	entries, err := eng.Manifest.EntriesOf(selID)
+	must(err)
+	for _, se := range entries {
+		if se.RelPath == "unique.bin" {
+			victimDigest = se.ChunkDigests[0]
+		}
+	}
+	blobPath, err := eng.Store.Path(victimDigest)
+	must(err)
+	savedBlob, err := os.ReadFile(blobPath)
+	must(err)
+	must(os.Remove(blobPath)) // simulate storage loss of one chunk
+	fmt.Printf("  故障注入: 删除 unique.bin 的块 %x…\n", victimDigest[:8])
+
+	partial3 := filepath.Join(work, "partial-3")
+	code, body = raw("POST", srv.URL+"/v1/restore-jobs", map[string]any{
+		"snapshot_id": selID, "target": partial3,
+		"paths": []string{"unique.bin"}, "idempotency_key": "demo-p3",
+	})
+	check("缺块时 -> 409 restore_job_failed", code == http.StatusConflict && body["error"] == "restore_job_failed")
+	failedJob := body["job"].(map[string]any)
+	check("作业持久化为 failed 且错误点名 unique.bin", failedJob["status"] == "failed" &&
+		strings.Contains(failedJob["error"].(string), "unique.bin"))
+	jfiles, _ = body["files"].([]any)
+	located := false
+	for _, x := range jfiles {
+		m := x.(map[string]any)
+		if m["rel_path"] == "unique.bin" && m["status"] == "failed" &&
+			strings.Contains(m["error"].(string), fmt.Sprintf("%x", victimDigest)[:16]) {
+			located = true
+			fmt.Printf("  逐文件报告定位: %s -> %s\n", m["rel_path"], m["error"])
+		}
+	}
+	check("逐文件报告定位到具体文件与块摘要", located)
+	_, err = os.Lstat(partial3)
+	check("失败不留目标目录", os.IsNotExist(err))
+	stagingLeft, _ = filepath.Glob(filepath.Join(work, ".incbackup-restore-staging-*"))
+	check("失败不留暂存区", len(stagingLeft) == 0)
+
+	must(os.WriteFile(blobPath, savedBlob, 0o444)) // maintenance repairs the blob
+	failedJobID := int64(failedJob["id"].(float64))
+	code, body = raw("POST", srv.URL+fmt.Sprintf("/v1/restore-jobs/%d/retry", failedJobID), nil)
+	check("修复缺块后重试同一作业 -> 200 done", code == http.StatusOK &&
+		body["job"].(map[string]any)["status"] == "done")
+	gb, _ := hashFile(filepath.Join(partial3, "unique.bin"))
+	wb, _ := hashFile(filepath.Join(src, "unique.bin"))
+	check("重试后内容逐字节一致", gb == wb)
+	code, _ = raw("POST", srv.URL+fmt.Sprintf("/v1/snapshots/%d/restore", secondID),
+		map[string]any{"target": filepath.Join(work, "restore-after-drill")})
+	check("其他已提交快照仍可正常整树恢复", code == http.StatusCreated)
+
+	// 8.5 crash mid-job -> restart cleans its own staging, job retryable
+	partial4 := filepath.Join(work, "partial-4")
+	crashStaging := filepath.Join(work, ".incbackup-restore-staging-crash01")
+	crashJobID, err := eng.Manifest.InsertRestoreJob(&repo.RestoreJob{
+		IdempotencyKey: "demo-crash", SnapshotID: firstID,
+		Target: partial4, Staging: crashStaging, RequestedPaths: []string{"run.sh"},
+	})
+	must(err)
+	must(eng.Manifest.UpdateRestoreJobStatus(crashJobID, repo.JobRunning, ""))
+	must(os.MkdirAll(filepath.Join(crashStaging, "half-built"), 0o700))
+	fmt.Printf("  故障注入: 作业 %d 崩溃在 running，留下暂存区 %s\n", crashJobID, filepath.Base(crashStaging))
+	srv.Close()
+
+	srv, eng = startServer(repoDir) // startup recovery runs
+	cj := get(srv.URL + fmt.Sprintf("/v1/restore-jobs/%d", crashJobID))["job"].(map[string]any)
+	check("崩溃的 running 作业被标记 failed（可重试）", cj["status"] == "failed")
+	_, err = os.Lstat(crashStaging)
+	check("服务只清理自己创建的暂存区", os.IsNotExist(err))
+	code, body = raw("POST", srv.URL+fmt.Sprintf("/v1/restore-jobs/%d/retry", crashJobID), nil)
+	check("重试后作业完成", code == http.StatusOK && body["job"].(map[string]any)["status"] == "done")
+	g3, _ := hashFile(filepath.Join(partial4, "run.sh"))
+	w3, _ := hashFile(filepath.Join(src, "run.sh"))
+	check("恢复内容正确", g3 == w3)
 
 	// final listing
 	section(0, "快照总览")
@@ -295,7 +443,7 @@ func main() {
 
 // ---------- helpers ----------
 
-func startServer(repoDir string) *httptest.Server {
+func startServer(repoDir string) (*httptest.Server, *backup.Engine) {
 	must(os.MkdirAll(repoDir, 0o755))
 	manifest, err := repo.OpenManifest(filepath.Join(repoDir, "manifest.sqlite"))
 	must(err)
@@ -308,7 +456,12 @@ func startServer(repoDir string) *httptest.Server {
 			fmt.Printf("  [启动恢复] 快照 %d -> %s\n", r.SnapshotID, r.Status)
 		}
 	}
-	return httptest.NewServer((&api.Server{Engine: engine}).NewRouter())
+	if jobs, err := engine.RecoverRestoreJobs(); err == nil {
+		for _, j := range jobs {
+			fmt.Printf("  [启动恢复] 恢复作业 %d -> %s\n", j.ID, j.Status)
+		}
+	}
+	return httptest.NewServer((&api.Server{Engine: engine}).NewRouter()), engine
 }
 
 func post(url string, body any) map[string]any {

@@ -181,6 +181,29 @@ func (m *Manifest) ReferencedChunks(id int64) ([]ChunkRef, error) {
 	return out, rows.Err()
 }
 
+// ChunkLengthMap returns digest -> declared catalog length for every chunk a
+// snapshot references. Selective restore uses it to verify each chunk's
+// streamed length and to detect references whose catalog row is missing.
+func (m *Manifest) ChunkLengthMap(id int64) (map[string]int64, error) {
+	rows, err := m.db.Query(`SELECT DISTINCT c.digest, c.length
+		FROM entry_chunks ec JOIN chunks c ON c.digest = ec.chunk_digest
+		WHERE ec.snapshot_id = ?`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int64{}
+	for rows.Next() {
+		var d []byte
+		var length int64
+		if err := rows.Scan(&d, &length); err != nil {
+			return nil, err
+		}
+		out[string(d)] = length
+	}
+	return out, rows.Err()
+}
+
 // MissingChunk is a reference that cannot currently be satisfied from the
 // content store: either the chunk row is missing from the catalog, or the
 // blob file is absent / has the wrong length.

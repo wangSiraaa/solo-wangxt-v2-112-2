@@ -19,6 +19,17 @@ const (
 	StatusFailed    = "failed"    // verification or commit failed; see snapshot_errors
 )
 
+// Selective-restore job states. A job is created pending, flips to running
+// while its staging tree is built and verified, and ends done (atomically
+// published) or failed (staging cleaned up, retryable). A process crash
+// leaves pending/running rows behind, which startup recovery reconciles.
+const (
+	JobPending = "pending"
+	JobRunning = "running"
+	JobFailed  = "failed"
+	JobDone    = "done"
+)
+
 // Manifest is the SQLite-backed backup catalog.
 type Manifest struct {
 	db *sql.DB
@@ -119,6 +130,40 @@ CREATE INDEX IF NOT EXISTS idx_err_snap ON snapshot_errors(snapshot_id);
 CREATE TABLE IF NOT EXISTS meta (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
+);
+
+-- Selective restore jobs: a frozen (snapshot, path-set, target) request with
+-- its full lifecycle. idempotency_key lets a retried request return the same
+-- job instead of building a second tree.
+CREATE TABLE IF NOT EXISTS restore_jobs (
+	id              INTEGER PRIMARY KEY AUTOINCREMENT,
+	idempotency_key TEXT    NOT NULL UNIQUE,
+	snapshot_id     INTEGER NOT NULL REFERENCES snapshots(id),
+	target          TEXT    NOT NULL, -- final destination (absolute path)
+	staging         TEXT    NOT NULL, -- private staging dir, sibling of target
+	status          TEXT    NOT NULL, -- pending | running | failed | done
+	requested_paths TEXT    NOT NULL, -- JSON array of normalized rel paths (frozen)
+	error           TEXT    NOT NULL DEFAULT '',
+	created_at      TEXT    NOT NULL,
+	updated_at      TEXT    NOT NULL,
+	finished_at     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_restore_jobs_snap ON restore_jobs(snapshot_id);
+
+-- Per-file execution report of one restore job. Rows are the frozen restore
+-- plan (requested paths + auto-added parent directories) and end up done or
+-- failed with the verified measurements of what was written in staging.
+CREATE TABLE IF NOT EXISTS restore_job_files (
+	job_id      INTEGER NOT NULL REFERENCES restore_jobs(id) ON DELETE CASCADE,
+	rel_path    TEXT    NOT NULL,
+	kind        TEXT    NOT NULL,             -- file | dir | symlink
+	implicit    INTEGER NOT NULL DEFAULT 0,   -- 1 = auto-added parent directory
+	status      TEXT    NOT NULL,             -- pending | done | failed
+	size        INTEGER NOT NULL DEFAULT 0,
+	digest      TEXT    NOT NULL DEFAULT '',  -- whole-file SHA-256 hex, files only
+	chunk_count INTEGER NOT NULL DEFAULT 0,
+	error       TEXT    NOT NULL DEFAULT '',
+	PRIMARY KEY (job_id, rel_path)
 );
 `
 

@@ -56,6 +56,16 @@ func main() {
 		}
 	}
 
+	// A crash mid-restore leaves pending/running job rows; continue pending
+	// ones and clean up (only our own) staging areas of interrupted ones.
+	if jobs, err := engine.RecoverRestoreJobs(); err != nil {
+		log.Printf("startup restore-job recovery: %v", err)
+	} else {
+		for _, j := range jobs {
+			log.Printf("startup recovery: restore job %d -> %s", j.ID, j.Status)
+		}
+	}
+
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		log.Fatalf("listen %s: %v", *addr, err)

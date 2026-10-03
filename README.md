@@ -22,17 +22,19 @@
 ## 目录结构
 
 ```
-cmd/backupd/main.go          HTTP 服务（启动时自动复验 pending 快照）
-cmd/demo/main.go             端到端演示（走真实 HTTP API，含 23 项断言）
+cmd/backupd/main.go          HTTP 服务（启动时自动复验 pending 快照、恢复中断的恢复作业）
+cmd/demo/main.go             端到端演示（走真实 HTTP API，含 50 项断言）
 internal/repo/
   contentstore.go            内容寻址块仓（原子写、读时校验摘要、分片目录）
   manifest.go                SQLite schema 与快照状态机（pending/committed/failed）
-  manifest_write.go          条目/块写入、缺块诊断查询
+  manifest_write.go          条目/块写入、缺块诊断查询、块长度目录
+  restore_jobs.go            选择性恢复作业与逐文件报告的持久化
   meta.go                    分块多项式持久化
 internal/backup/
   scan.go                    不跟随链接的目录扫描、分块、整文件摘要、写入中重读
-  engine.go                  快照编排、提交前逐块验证、恢复与全部安全约束
-  util_linux.go              O_EXCL|O_NOFOLLOW 建文件（阻止沿预置符号链接写出）
+  engine.go                  快照编排、提交前逐块验证、整树恢复与全部安全约束
+  selective.go               选择性恢复：路径规范化、选择展开、暂存+原子发布、崩溃恢复
+  util_linux.go              O_EXCL|O_NOFOLLOW 建文件、RENAME_NOREPLACE 原子发布
 internal/api/server.go       HTTP 路由
 ```
 
@@ -56,6 +58,10 @@ go run ./cmd/backupd --repo ./backup-repo --addr 127.0.0.1:8090
 | `POST /v1/snapshots/{id}/verify` | 对 pending 快照重新执行逐块验证并提交/判失败 |
 | `POST /v1/snapshots/{id}/restore` | 恢复到**全新**目录，返回逐文件长度+摘要+块数报告 |
 | `POST /v1/recover` | 复验所有 pending 快照（服务启动时也会自动执行） |
+| `POST /v1/restore-jobs` | **选择性恢复**：冻结 `{snapshot_id, target, paths[], idempotency_key}` 为作业并执行；同键重放返回同一作业 |
+| `GET  /v1/restore-jobs` / `GET /v1/restore-jobs/{id}` | 列出/查询恢复作业（pending/running/failed/done 持久化在 SQLite） |
+| `POST /v1/restore-jobs/{id}/retry` | 以冻结的选择重跑 failed 作业（done 作业直接返回，不产生第二棵树） |
+| `GET  /v1/restore-jobs/{id}/files` | 逐文件报告：计划行（含自动补足的父目录）、状态、长度、摘要、块数、失败原因 |
 
 ### 典型请求
 
@@ -75,6 +81,27 @@ curl -s -XPOST localhost:8090/v1/snapshots/7/restore \
   -d '{"target":"/restore/2026-09-29"}'
 ```
 
+### 选择性恢复
+
+```bash
+# 只恢复一个深层文件（父目录自动补足），幂等键防止重复建树
+curl -s -XPOST localhost:8090/v1/restore-jobs \
+  -d '{"snapshot_id":7,"target":"/restore/just-notes",
+       "paths":["docs/notes.txt"],"idempotency_key":"req-2026-10-03-1"}'
+# 201 {"job":{"id":3,"status":"done",...},"files":[
+#   {"rel_path":"docs","kind":"dir","implicit":true,"status":"done",...},
+#   {"rel_path":"docs/notes.txt","kind":"file","status":"done",
+#    "size":14,"digest":"…","chunk_count":1}]}
+
+# 选中的符号链接指向未被选中的内部目标 → 预检拒绝，什么都不创建
+curl -s -XPOST localhost:8090/v1/restore-jobs \
+  -d '{"snapshot_id":7,"target":"/restore/bad","paths":["link_to_notes"]}'
+# 422 {"error":"missing_link_deps","details":{"missing":["docs/notes.txt"]}}
+
+# 缺块/坏块 → 作业 failed，逐文件报告定位到具体块；修复后重试同一作业
+curl -s -XPOST localhost:8090/v1/restore-jobs/3/retry
+```
+
 ## 关键正确性保证
 
 1. **完成前验证所有内容块**：`snapshots.status` 只有 pending→committed/failed。
@@ -91,6 +118,12 @@ curl -s -XPOST localhost:8090/v1/snapshots/7/restore \
 6. **空文件**：长度 0、整文件摘要 `e3b0c442…`、0 个内容块，正常备份与恢复。
 7. **失败可定位**：failed/pending 快照永久保留，`/missing` 直接给出“哪个文件的哪个块该在哪个路径”，
    而不是只看到队列空了。
+8. **选择性恢复的最小范围与原子性**：作业冻结（快照号 + 规范化路径集合 + 目标）于 SQLite
+   （pending/running/failed/done）；只从该快照清单读取，目录选择含子树、文件父目录自动补足；
+   选中的符号链接若指向未被选中的内部目标，预检直接拒绝并点名应纳入的依赖，链接目标绝不重写；
+   全部内容在目标同一父目录的私有暂存区（0700）内逐块、逐文件验证后，
+   用 `RENAME_NOREPLACE` 原子发布——不覆盖、不留半成品；
+   崩溃后只继续或清理自己创建的暂存区，发布已完成的则重新核对已发布树再定结论。
 
 ## 演示会依次证明
 
@@ -100,4 +133,8 @@ curl -s -XPOST localhost:8090/v1/snapshots/7/restore \
 4. 写入在重读窗口内停止 → 重读后成功；持续写入 → 3 次重读后拒绝并点名；
 5. `lose_chunks:1` 模拟提交中断 → `failed` + `/missing` 给出精确缺块，旧快照仍可恢复；
 6. 指向根目录外的符号链接 → 恢复 `422`，半成品目录回滚，外部文件不被触及；
-7. `finish:false` 制造 pending → 重启服务后自动复验为 committed。
+7. `finish:false` 制造 pending → 重启服务后自动复验为 committed；
+8. 选择性恢复：深层文件只恢复自身与必要目录（摘要/权限/mtime 正确）；漏选链接目标预检 `422`
+   且目标不存在；同一幂等键重放返回同一作业、已有目标仍 `409` 不留半成品；
+   删块后作业 `failed` 且逐文件报告定位到块，修复后 `retry` 成功，其他快照整树恢复不受影响；
+   崩溃留下的 running 作业在重启时清理自有暂存区并可重试完成。
