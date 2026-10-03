@@ -120,6 +120,58 @@ CREATE TABLE IF NOT EXISTS meta (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
 );
+
+-- Selective restore jobs are durable state machines. The frozen snapshot id,
+-- absolute destination, normalized request paths, and private staging path are
+-- recorded before work starts, so a restart can continue or clean up only the
+-- staging directory that this job created.
+CREATE TABLE IF NOT EXISTS restore_jobs (
+	id              INTEGER PRIMARY KEY AUTOINCREMENT,
+	snapshot_id     INTEGER NOT NULL REFERENCES snapshots(id),
+	target_path     TEXT    NOT NULL,
+	idempotency_key TEXT,
+	status          TEXT    NOT NULL CHECK(status IN ('pending','running','failed','completed')),
+	staging_path    TEXT    NOT NULL,
+	stage           TEXT    NOT NULL DEFAULT '',
+	rel_path        TEXT    NOT NULL DEFAULT '',
+	message         TEXT    NOT NULL DEFAULT '',
+	file_count      INTEGER NOT NULL DEFAULT 0,
+	dir_count       INTEGER NOT NULL DEFAULT 0,
+	symlink_count   INTEGER NOT NULL DEFAULT 0,
+	bytes_total     INTEGER NOT NULL DEFAULT 0,
+	created_at      TEXT    NOT NULL,
+	updated_at      TEXT    NOT NULL,
+	started_at      TEXT,
+	finished_at     TEXT,
+	UNIQUE(idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_restore_jobs_status ON restore_jobs(status);
+
+CREATE TABLE IF NOT EXISTS restore_job_paths (
+	job_id      INTEGER NOT NULL REFERENCES restore_jobs(id) ON DELETE CASCADE,
+	rel_path    TEXT    NOT NULL,
+	relation    TEXT    NOT NULL CHECK(relation IN ('requested','effective')),
+	entry_order INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (job_id, relation, rel_path)
+);
+
+CREATE TABLE IF NOT EXISTS restore_job_entries (
+	job_id      INTEGER NOT NULL REFERENCES restore_jobs(id) ON DELETE CASCADE,
+	rel_path    TEXT    NOT NULL,
+	kind        TEXT    NOT NULL,
+	entry_order INTEGER NOT NULL,
+	status      TEXT    NOT NULL CHECK(status IN ('pending','running','failed','verified')),
+	size        INTEGER NOT NULL DEFAULT 0,
+	file_digest BLOB,
+	mode        INTEGER NOT NULL DEFAULT 0,
+	mod_time_ns INTEGER NOT NULL DEFAULT 0,
+	chunk_count INTEGER NOT NULL DEFAULT 0,
+	link_target TEXT    NOT NULL DEFAULT '',
+	error       TEXT    NOT NULL DEFAULT '',
+	updated_at  TEXT    NOT NULL,
+	PRIMARY KEY (job_id, rel_path)
+);
+CREATE INDEX IF NOT EXISTS idx_restore_job_entries_order ON restore_job_entries(job_id, entry_order);
 `
 
 func (m *Manifest) migrate() error {

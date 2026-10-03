@@ -308,6 +308,9 @@ func startServer(repoDir string) *httptest.Server {
 			fmt.Printf("  [启动恢复] 快照 %d -> %s\n", r.SnapshotID, r.Status)
 		}
 	}
+	if err := engine.RecoverSelectiveRestores(); err != nil {
+		fmt.Printf("  [选择性恢复启动恢复] %v\n", err)
+	}
 	return httptest.NewServer((&api.Server{Engine: engine}).NewRouter())
 }
 

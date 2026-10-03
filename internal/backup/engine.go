@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,6 +30,11 @@ type Failpoints struct {
 	// blob files from the content store before verification runs,
 	// simulating a crash/loss during commit finalization.
 	LoseChunkCount int
+
+	// BeforeRestoreOpenChunk is called immediately before a selective restore
+	// opens a chunk, allowing deterministic tests to corrupt the blob or
+	// interrupt service at the exact block boundary.
+	BeforeRestoreOpenChunk func(snapshotID int64, relPath string, digest []byte)
 }
 
 // Engine ties the manifest and content store together.
@@ -38,7 +44,13 @@ type Engine struct {
 	Pol      chunker.Pol
 	Fail     Failpoints
 
-	mu sync.Mutex // serializes snapshots: scan + commit is one critical section
+	// mu serializes snapshot scan/finalization. Restore jobs use a separate
+	// lock because restores only read immutable committed snapshot data.
+	mu        sync.Mutex
+	restoreMu sync.Mutex
+	// restoreJobs tracks workers in this process and prevents a retry from
+	// starting a second worker for an already running job.
+	restoreJobs map[int64]struct{}
 }
 
 // NewEngine opens an engine, loading the repository's chunking polynomial
@@ -58,7 +70,12 @@ func NewEngine(m *repo.Manifest, s *repo.ContentStore) (*Engine, error) {
 			return nil, err
 		}
 	}
-	return &Engine{Manifest: m, Store: s, Pol: chunker.Pol(pol)}, nil
+	return &Engine{
+		Manifest:    m,
+		Store:       s,
+		Pol:         chunker.Pol(pol),
+		restoreJobs: map[int64]struct{}{},
+	}, nil
 }
 
 // CreateSnapshotResult reports what happened for one snapshot request.
@@ -374,7 +391,9 @@ func (e *Engine) Restore(snapshotID int64, target string) (*RestoreResult, error
 			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 				return nil, err
 			}
-			rep, err := e.restoreFile(se, dst)
+			rep, err := restoreFileFrom(se, dst, func(digest []byte) (io.ReadCloser, error) {
+				return e.Store.Open(digest) // verifies chunk digest while streaming
+			})
 			if err != nil {
 				return nil, fmt.Errorf("restore %s: %w", se.RelPath, err)
 			}
@@ -449,10 +468,10 @@ func (e *Engine) Restore(snapshotID int64, target string) (*RestoreResult, error
 	return res, nil
 }
 
-// restoreFile creates one regular file with O_CREATE|O_EXCL, streams every
-// referenced chunk (each digest-checked by the store reader), then compares
-// total length and the whole-file SHA-256 with the manifest.
-func (e *Engine) restoreFile(se repo.StoredEntry, dst string) (FileReport, error) {
+// restoreFileFrom creates one regular file with O_CREATE|O_EXCL, streams every
+// referenced chunk (each digest-checked by openChunk), then compares total
+// length and the whole-file SHA-256 with the manifest.
+func restoreFileFrom(se repo.StoredEntry, dst string, openChunk func([]byte) (io.ReadCloser, error)) (FileReport, error) {
 	// O_EXCL: never overwrite an existing leaf, even a pre-existing symlink
 	// that would redirect the open outside target.
 	f, err := openExclusiveFile(dst, os.FileMode(se.Mode).Perm())
@@ -472,7 +491,7 @@ func (e *Engine) restoreFile(se repo.StoredEntry, dst string) (FileReport, error
 	}()
 
 	for _, d := range se.ChunkDigests {
-		rc, err := e.Store.Open(d) // verifies chunk digest while streaming
+		rc, err := openChunk(d) // verifies chunk digest while streaming
 		if err != nil {
 			return FileReport{}, err
 		}

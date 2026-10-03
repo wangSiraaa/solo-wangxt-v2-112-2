@@ -55,6 +55,9 @@ func main() {
 			log.Printf("startup recovery: snapshot %d -> %s", r.SnapshotID, r.Status)
 		}
 	}
+	if err := engine.RecoverSelectiveRestores(); err != nil {
+		log.Printf("selective restore startup recovery: %v", err)
+	}
 
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {

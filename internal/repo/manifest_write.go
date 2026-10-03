@@ -2,6 +2,7 @@ package repo
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -292,6 +293,20 @@ func (m *Manifest) SingletonChunks(id int64, n int) ([]ChunkRef, error) {
 func (m *Manifest) DeleteChunkRow(digest []byte) error {
 	_, err := m.db.Exec(`DELETE FROM chunks WHERE digest = ?`, digest)
 	return err
+}
+
+// ChunkLength returns the catalog length for one chunk. Selective restore
+// preflight uses it before touching the destination.
+func (m *Manifest) ChunkLength(digest []byte) (int64, bool, error) {
+	var length int64
+	err := m.db.QueryRow(`SELECT length FROM chunks WHERE digest = ?`, digest).Scan(&length)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return length, true, nil
 }
 
 // ChunkRowExists reports whether a chunk row exists.

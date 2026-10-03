@@ -27,12 +27,14 @@ cmd/demo/main.go             端到端演示（走真实 HTTP API，含 23 项�
 internal/repo/
   contentstore.go            内容寻址块仓（原子写、读时校验摘要、分片目录）
   manifest.go                SQLite schema 与快照状态机（pending/committed/failed）
+  restore_jobs.go            选择性恢复作业、冻结路径和逐文件报告的状态持久化
   manifest_write.go          条目/块写入、缺块诊断查询
   meta.go                    分块多项式持久化
 internal/backup/
   scan.go                    不跟随链接的目录扫描、分块、整文件摘要、写入中重读
   engine.go                  快照编排、提交前逐块验证、恢复与全部安全约束
-  util_linux.go              O_EXCL|O_NOFOLLOW 建文件（阻止沿预置符号链接写出）
+  selective.go               选择性恢复计划、符号链接依赖预检、暂存原子发布与崩溃恢复
+  util_linux.go              O_EXCL|O_NOFOLLOW 建文件、RENAME_NOREPLACE 原子发布（阻止沿预置符号链接写出）
 internal/api/server.go       HTTP 路由
 ```
 
@@ -55,6 +57,10 @@ go run ./cmd/backupd --repo ./backup-repo --addr 127.0.0.1:8090
 | `GET  /v1/snapshots/{id}/errors` | 扫描/验证阶段的逐条错误（stage、rel_path、chunk_digest） |
 | `POST /v1/snapshots/{id}/verify` | 对 pending 快照重新执行逐块验证并提交/判失败 |
 | `POST /v1/snapshots/{id}/restore` | 恢复到**全新**目录，返回逐文件长度+摘要+块数报告 |
+| `POST /v1/selective-restores` | 创建选择性恢复作业：冻结快照号、规范化相对路径集合和幂等键 |
+| `GET  /v1/selective-restores/{job_id}` | 查询 pending/running/failed/completed 作业及失败定位 |
+| `POST /v1/selective-restores/{job_id}/retry` | 重试 failed 作业（重新预检，不覆盖已有目标） |
+| `GET  /v1/selective-restores/{job_id}/files` | 逐目录/文件/符号链接报告：状态、长度、摘要、权限、mtime、块数 |
 | `POST /v1/recover` | 复验所有 pending 快照（服务启动时也会自动执行） |
 
 ### 典型请求
@@ -73,6 +79,16 @@ curl -s localhost:8090/v1/snapshots/7/missing
 
 curl -s -XPOST localhost:8090/v1/snapshots/7/restore \
   -d '{"target":"/restore/2026-09-29"}'
+
+# 只恢复一个深层文件；父目录从该快照清单自动补足
+curl -s -XPOST localhost:8090/v1/selective-restores -d '{
+  "snapshot_id": 7,
+  "target": "/restore/one-file",
+  "paths": ["var/log/app/2026-09-29.log"],
+  "idempotency_key": "app-log-20260929"
+}'
+curl -s localhost:8090/v1/selective-restores/1/files
+curl -s -XPOST localhost:8090/v1/selective-restores/1/retry
 ```
 
 ## 关键正确性保证
@@ -91,6 +107,14 @@ curl -s -XPOST localhost:8090/v1/snapshots/7/restore \
 6. **空文件**：长度 0、整文件摘要 `e3b0c442…`、0 个内容块，正常备份与恢复。
 7. **失败可定位**：failed/pending 快照永久保留，`/missing` 直接给出“哪个文件的哪个块该在哪个路径”，
    而不是只看到队列空了。
+8. **选择性恢复**：作业在 SQLite 中固定快照号、规范化请求路径、生效路径与逐文件状态
+   （pending/running/failed/completed）。只读取指定快照；选择深层文件时自动补足清单中的父目录。
+   选中的内部符号链接必须显式包含其链接链和最终目标，预检缺依赖时目标目录和私有暂存区都不会创建。
+9. **选择性恢复原子发布**：每个作业先在目标同一父目录的私有 `.increstore-job-*` 暂存区构造，
+   逐块、逐文件验证摘要/长度，再应用权限与时间；只有全部通过才以 Linux `RENAME_NOREPLACE`
+   原子发布。失败只删除该作业自己的暂存区，绝不覆盖目标或重写链接目标。
+10. **作业崩溃恢复与幂等**：重复请求携带相同 `idempotency_key` 会返回同一作业，不产生第二棵树；
+    重启后只核对或清理该作业行中记录的私有暂存区。若发布后的目标已完整则标记完成，否则清理后继续。
 
 ## 演示会依次证明
 

@@ -29,3 +29,19 @@ func chown(path string, uid, gid int) {
 func lchown(path string, uid, gid int) {
 	_ = unix.Fchownat(unix.AT_FDCWD, path, uid, gid, unix.AT_SYMLINK_NOFOLLOW)
 }
+
+// renameNoReplace atomically moves old to new only if new does not exist.
+// The destination is published in one directory-entry operation, so callers
+// never merge a partially populated restore tree into the target.
+func renameNoReplace(old, new string) error {
+	return unix.Renameat2(unix.AT_FDCWD, old, unix.AT_FDCWD, new, unix.RENAME_NOREPLACE)
+}
+
+func syncDir(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}

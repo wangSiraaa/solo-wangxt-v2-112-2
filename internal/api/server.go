@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -31,6 +32,10 @@ func (s *Server) NewRouter() http.Handler {
 	mux.HandleFunc("GET /v1/snapshots/{id}/errors", s.listErrors)
 	mux.HandleFunc("GET /v1/snapshots/{id}/missing", s.missing)
 	mux.HandleFunc("POST /v1/snapshots/{id}/restore", s.restore)
+	mux.HandleFunc("POST /v1/selective-restores", s.createSelectiveRestore)
+	mux.HandleFunc("GET /v1/selective-restores/{job_id}", s.getSelectiveRestore)
+	mux.HandleFunc("POST /v1/selective-restores/{job_id}/retry", s.retrySelectiveRestore)
+	mux.HandleFunc("GET /v1/selective-restores/{job_id}/files", s.selectiveRestoreFiles)
 	return mux
 }
 
@@ -347,4 +352,200 @@ func (s *Server) recover(w http.ResponseWriter, r *http.Request) {
 		ids = append(ids, map[string]any{"snapshot_id": r.SnapshotID, "status": r.Status})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"recovered": ids})
+}
+
+type selectiveRestoreReq struct {
+	SnapshotID     int64    `json:"snapshot_id"`
+	Target         string   `json:"target"`
+	Paths          []string `json:"paths"`
+	IdempotencyKey string   `json:"idempotency_key"`
+}
+
+type selectiveJobResp struct {
+	ID             int64      `json:"id"`
+	SnapshotID     int64      `json:"snapshot_id"`
+	Target         string     `json:"target"`
+	IdempotencyKey string     `json:"idempotency_key,omitempty"`
+	Status         string     `json:"status"`
+	Stage          string     `json:"stage,omitempty"`
+	RelPath        string     `json:"rel_path,omitempty"`
+	Message        string     `json:"message,omitempty"`
+	Files          int64      `json:"files"`
+	Directories    int64      `json:"directories"`
+	Symlinks       int64      `json:"symlinks"`
+	Bytes          int64      `json:"bytes_total"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+	StartedAt      *time.Time `json:"started_at,omitempty"`
+	FinishedAt     *time.Time `json:"finished_at,omitempty"`
+}
+
+func toSelectiveJobResp(j repo.RestoreJobInfo) selectiveJobResp {
+	r := selectiveJobResp{
+		ID: j.ID, SnapshotID: j.SnapshotID, Target: j.Target,
+		IdempotencyKey: j.Idempotency, Status: j.Status, Stage: j.Stage,
+		RelPath: j.RelPath, Message: j.Message, Files: j.FileCount,
+		Directories: j.DirCount, Symlinks: j.SymlinkCount, Bytes: j.BytesTotal,
+		CreatedAt: j.CreatedAt, UpdatedAt: j.UpdatedAt,
+		StartedAt: j.StartedAt, FinishedAt: j.FinishedAt,
+	}
+	return r
+}
+
+func parseJobID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	id, err := strconv.ParseInt(r.PathValue("job_id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_id", "restore job id must be an integer", nil)
+		return 0, false
+	}
+	return id, true
+}
+
+func writeSelectiveError(w http.ResponseWriter, err error) {
+	var sel *backup.SelectiveRestoreError
+	if errors.As(err, &sel) {
+		writeJSON(w, sel.Status, map[string]any{
+			"error":   sel.Code,
+			"message": sel.Code,
+			"details": sel.Reasons,
+		})
+		return
+	}
+	if errors.Is(err, repo.ErrRestoreJobNotFound) {
+		writeErr(w, http.StatusNotFound, "not_found", "restore job does not exist", nil)
+		return
+	}
+	if errors.Is(err, backup.ErrTargetExists) {
+		writeErr(w, http.StatusConflict, "target_exists", err.Error(), nil)
+		return
+	}
+	writeErr(w, http.StatusInternalServerError, "restore_job_failed", err.Error(), nil)
+}
+
+func (s *Server) createSelectiveRestore(w http.ResponseWriter, r *http.Request) {
+	var req selectiveRestoreReq
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeErr(w, http.StatusBadRequest, "bad_json", err.Error(), nil)
+			return
+		}
+	}
+	if strings.TrimSpace(req.Target) == "" {
+		writeErr(w, http.StatusBadRequest, "bad_request", "target is required", nil)
+		return
+	}
+	if len(req.Paths) == 0 {
+		writeErr(w, http.StatusBadRequest, "bad_request", "paths is required", nil)
+		return
+	}
+	job, created, err := s.Engine.CreateSelectiveRestore(backup.SelectiveRestoreRequest{
+		SnapshotID:     req.SnapshotID,
+		Target:         req.Target,
+		Paths:          req.Paths,
+		IdempotencyKey: req.IdempotencyKey,
+	})
+	if err != nil {
+		writeSelectiveError(w, err)
+		return
+	}
+	// Give a tiny asynchronous worker a chance to complete tiny jobs without
+	// forcing callers to poll; larger jobs remain pending/running.
+	time.Sleep(time.Millisecond)
+	latest, err := s.Engine.GetSelectiveRestore(job.ID)
+	if err != nil {
+		latest = job
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, toSelectiveJobResp(*latest))
+}
+
+func (s *Server) getSelectiveRestore(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseJobID(w, r)
+	if !ok {
+		return
+	}
+	job, err := s.Engine.GetSelectiveRestore(id)
+	if err != nil {
+		writeSelectiveError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toSelectiveJobResp(*job))
+}
+
+func (s *Server) retrySelectiveRestore(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseJobID(w, r)
+	if !ok {
+		return
+	}
+	job, err := s.Engine.RetrySelectiveRestore(id)
+	if err != nil {
+		if errors.Is(err, repo.ErrRestoreJobNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found", "restore job does not exist", nil)
+			return
+		}
+		if errors.Is(err, backup.ErrTargetExists) {
+			writeErr(w, http.StatusConflict, "target_exists", err.Error(), nil)
+			return
+		}
+		var sel *backup.SelectiveRestoreError
+		if errors.As(err, &sel) {
+			writeJSON(w, sel.Status, map[string]any{
+				"error": sel.Code, "message": sel.Code, "details": sel.Reasons,
+			})
+			return
+		}
+		writeErr(w, http.StatusConflict, "retry_rejected", err.Error(), nil)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, toSelectiveJobResp(*job))
+}
+
+func (s *Server) selectiveRestoreFiles(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseJobID(w, r)
+	if !ok {
+		return
+	}
+	if _, err := s.Engine.GetSelectiveRestore(id); err != nil {
+		writeSelectiveError(w, err)
+		return
+	}
+	entries, err := s.Engine.SelectiveRestoreFileReports(id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return
+	}
+	requested, _ := s.Engine.Manifest.RestoreJobPaths(id, repo.RestorePathRequested)
+	effective, _ := s.Engine.Manifest.RestoreJobPaths(id, repo.RestorePathEffective)
+	type fileResp struct {
+		RelPath    string      `json:"rel_path"`
+		Kind       string      `json:"kind"`
+		Status     string      `json:"status"`
+		Size       int64       `json:"size"`
+		Digest     string      `json:"digest,omitempty"`
+		Mode       os.FileMode `json:"mode"`
+		ModTime    time.Time   `json:"mod_time"`
+		ChunkCount int         `json:"chunk_count"`
+		LinkTarget string      `json:"link_target,omitempty"`
+		Error      string      `json:"error,omitempty"`
+	}
+	out := make([]fileResp, 0, len(entries))
+	for _, en := range entries {
+		item := fileResp{
+			RelPath: en.RelPath, Kind: en.Kind, Status: en.Status,
+			Size: en.Size, Mode: os.FileMode(en.Mode).Perm(),
+			ModTime: en.ModTime, ChunkCount: en.ChunkCount,
+			LinkTarget: en.LinkTarget, Error: en.Error,
+		}
+		if len(en.FileDigest) > 0 {
+			item.Digest = hex.EncodeToString(en.FileDigest)
+		}
+		out = append(out, item)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"job_id": id, "requested_paths": requested,
+		"effective_paths": effective, "files": out,
+	})
 }
